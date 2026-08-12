@@ -125,14 +125,18 @@ cswap run 2                     # launch Claude Code as account 2, here only
 cswap run user@example.com      # by email
 cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --share-history     # share your chat history with this account too
+cswap run 2 --share-peers       # let this session and your others message each other
 ```
 
 Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
 
+Sessions also can't see each other across accounts by default. Claude Code discovers a peer through a registry under its config directory, and a session profile has its own, so a `cswap run` session and your default login are invisible to one another — even though both are listening and both belong to you. `--share-peers` shares that registry, and the two can then list and message each other.
+
 <details>
-<summary>Sharing details — MCP servers & chat history</summary>
+<summary>Sharing details — MCP servers, chat history & peers</summary>
 
 - With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
+- With `--share-peers`, the session registers alongside your other sessions instead of in its own directory. A registry the profile already had is discarded when nothing is running in it — every entry names a process that has since exited — and left alone while a session is live, which retries on the next launch. Note that `cswap list`'s *Running instances* reads the same directory, so counts from both profiles appear in one list.
 - User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
 - `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
 

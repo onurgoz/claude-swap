@@ -30,6 +30,14 @@ which would fork history rather than share it. If the profile already
 accumulated its own history, it is merged into ``~/.claude`` first so nothing
 disappears from ``--resume``.
 
+Peer sharing (``--share-peers``, opt-in): additionally links ``sessions/``, the
+registry Claude Code advertises a session in for peer messaging. Without it the
+isolation that lets two accounts run at once also hides their sessions from each
+other — the messaging sockets live in a machine-wide ``/tmp/cc-socks``, but each
+profile keeps its own registry, so neither side ever learns the other exists.
+POSIX-only, and for a sharper reason than history: a copied registry would
+advertise pids and sockets that are not live.
+
 This module must not import ``switcher`` (switcher imports us for the
 session-aware guards); it receives a ``ClaudeAccountSwitcher`` instance.
 """
@@ -88,6 +96,22 @@ HISTORY_ITEMS = (
     "projects",
     "history.jsonl",
 )
+
+# Peer-messaging registry, linked additionally under --share-peers.
+#
+# Claude Code advertises a session by writing ``sessions/<pid>.json`` (plus a
+# sibling ``.key``) under its config home and listening on
+# ``/tmp/cc-socks/<pid>.sock``. The socket path is machine-wide; the registry is
+# not. So the isolation that lets two accounts run at once is also what stops
+# their sessions from discovering each other, even though both sockets are live
+# and owned by the same user. Linking the directory is what closes that gap —
+# pids are unique per machine, so two profiles registering into one directory
+# cannot collide, and the ``.key`` a peer needs travels with its entry.
+#
+# POSIX symlinks only, and for a sharper reason than history: a *copied*
+# registry would advertise pids and sockets that are not this machine's live
+# ones, offering peers addresses that answer to nothing.
+PEER_ITEMS = ("sessions",)
 
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
@@ -507,6 +531,7 @@ class SessionManager:
         claude_args: list[str],
         share: bool = True,
         share_history: bool = False,
+        share_peers: bool = False,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal."""
         claude_bin = shutil.which("claude")
@@ -519,6 +544,12 @@ class SessionManager:
                 "--share-history is not supported on Windows yet: sharing uses "
                 "re-synced copies there, which would fork the history instead "
                 "of sharing it."
+            )
+        if share_peers and self.switcher.platform == Platform.WINDOWS:
+            raise SessionError(
+                "--share-peers is not supported on Windows yet: sharing uses "
+                "re-synced copies there, and a copied peer registry would "
+                "advertise pids and sockets that are not live."
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -558,7 +589,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, share_peers
         )
 
         print(
@@ -622,7 +653,11 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        share_peers: bool = False,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
@@ -639,7 +674,7 @@ class SessionManager:
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, share_peers)
             return session_dir, account_num, email
 
         # One refresh so the profile starts with a fresh access token —
@@ -741,11 +776,11 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                self._sync_sharing(session_dir, share, share_history)
+                self._sync_sharing(session_dir, share, share_history, share_peers)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, share_peers)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
@@ -999,15 +1034,21 @@ class SessionManager:
     # -- sharing ---------------------------------------------------------
 
     def _sync_sharing(
-        self, session_dir: Path, share: bool, share_history: bool = False
+        self,
+        session_dir: Path,
+        share: bool,
+        share_history: bool = False,
+        share_peers: bool = False,
     ) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
 
         ``share`` governs SHARED_ITEMS (customizations) and the mcpServers
         mirror (see ``_sync_mcp_servers`` — its --no-share removal is gated
         on the adoption marker); ``share_history`` governs HISTORY_ITEMS
-        (conversation history) — independent concerns, so ``--no-share
-        --share-history`` gives a bare profile with unified history.
+        (conversation history) and ``share_peers`` the PEER_ITEMS registry —
+        all independent concerns, so ``--no-share --share-history`` gives a
+        bare profile with unified history, and ``--share-peers`` alone gives
+        an isolated profile whose sessions are still discoverable.
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
@@ -1023,8 +1064,11 @@ class SessionManager:
         # this also drops any links left by a POSIX→Windows profile move).
         if self.switcher.platform == Platform.WINDOWS:
             share_history = False
-        active_items = (SHARED_ITEMS if share else ()) + (
-            HISTORY_ITEMS if share_history else ()
+            share_peers = False
+        active_items = (
+            (SHARED_ITEMS if share else ())
+            + (HISTORY_ITEMS if share_history else ())
+            + (PEER_ITEMS if share_peers else ())
         )
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
@@ -1032,13 +1076,15 @@ class SessionManager:
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
-        # For history items that holds even when the manifest claims them:
-        # a stale manifest (lock-free launches race) must never be able to
-        # delete real conversation history — only ever unlink symlinks.
+        # For history and peer items that holds even when the manifest claims
+        # them: a stale manifest (lock-free launches race) must never be able
+        # to delete real conversation history, or a profile's own live peer
+        # registry — only ever unlink symlinks.
+        unlink_only = HISTORY_ITEMS + PEER_ITEMS
         for name in managed:
             if name not in active_items:
                 dest = session_dir / name
-                if name in HISTORY_ITEMS and dest.exists() and not dest.is_symlink():
+                if name in unlink_only and dest.exists() and not dest.is_symlink():
                     continue
                 self._remove_managed(dest)
         if not active_items:
@@ -1053,6 +1099,11 @@ class SessionManager:
             dest = session_dir / name
 
             if name in HISTORY_ITEMS and not self._prepare_history_share(
+                src, dest, session_dir
+            ):
+                continue
+
+            if name in PEER_ITEMS and not self._prepare_peer_share(
                 src, dest, session_dir
             ):
                 continue
@@ -1368,6 +1419,54 @@ class SessionManager:
                 return False
         return True
 
+    def _prepare_peer_share(
+        self, src: Path, dest: Path, session_dir: Path
+    ) -> bool:
+        """Make the peer registry linkable; returns False to skip this launch.
+
+        Differs from history in what it does with what the profile already has,
+        and the difference is the point. History is user data, so it is merged
+        and never discarded. A peer registry is ephemeral runtime state keyed by
+        pid: every entry belongs to a process, and when the profile is quiescent
+        every one of those processes is gone. Merging dead entries would publish
+        addresses that answer to nothing, so a stale registry is discarded
+        instead — which is also why the generic loop cannot be used here: it
+        would see a pre-existing directory and refuse, and since every existing
+        profile has one, the flag would silently do nothing.
+
+        A profile that is *not* quiescent is left alone: its registry is live,
+        and moving it out from under a running claude would unpublish a session
+        that is still listening.
+        """
+        if dest.exists() and not dest.is_symlink():
+            if not profile_is_quiescent(session_dir):
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name} yet: another session is "
+                        "using this profile — retrying on the next launch."
+                    )
+                )
+                return False
+            try:
+                shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
+            except OSError as e:
+                self._logger.warning(f"Could not clear {dest}: {e}")
+                print(
+                    dimmed(
+                        f"Not sharing {dest.name}: clearing the profile's "
+                        "stale registry failed (see log)."
+                    )
+                )
+                return False
+        if not src.exists():
+            try:
+                # 0o700: the registry holds each session's messaging key.
+                _mkdir_private(src)
+            except OSError as e:
+                self._logger.warning(f"Could not create {src}: {e}")
+                return False
+        return True
+
     @staticmethod
     def _merge_history_into_source(src: Path, dest: Path) -> None:
         """Move the profile's own history at ``dest`` into ``src``.
@@ -1415,7 +1514,9 @@ class SessionManager:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
             items = data.get("items", [])
             # Only ever act on names we could have created.
-            return [i for i in items if i in SHARED_ITEMS + HISTORY_ITEMS]
+            return [
+                i for i in items if i in SHARED_ITEMS + HISTORY_ITEMS + PEER_ITEMS
+            ]
         except (OSError, json.JSONDecodeError, AttributeError):
             return []
 

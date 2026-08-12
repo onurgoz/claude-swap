@@ -131,6 +131,7 @@ Examples:
   cswap run user@example.com
   cswap run 2 --no-share
   cswap run 2 --share-history
+  cswap run 2 --share-peers
   cswap run 2 -- --resume
         """,
     )
@@ -163,6 +164,21 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--share-peers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Share the peer-messaging registry (sessions/) from ~/.claude into "
+            "the session profile, so sessions running as different accounts can "
+            "discover and message each other. Without it a session profile has "
+            "its own registry and is invisible to the default login. A stale "
+            "registry in the profile is discarded (it only holds dead pids); a "
+            "live one is left alone until the next launch. --no-share-peers "
+            "restores per-account isolation (the default). Not supported on "
+            "Windows."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -183,6 +199,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_peers=args.share_peers,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -194,6 +211,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                share_peers=args.share_peers,
             )
             return  # only reachable in tests
         if email is not None:

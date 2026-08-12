@@ -1965,6 +1965,130 @@ class TestShareHistoryWindows:
             mgr.run(ACCOUNT_NUM, [], share=True, share_history=True)
 
 
+# ---------------------------------------------------------------------------
+# peer sharing (--share-peers)
+# ---------------------------------------------------------------------------
+#
+# Claude Code advertises a session for peer messaging by writing
+# ``<config_home>/sessions/<pid>.json`` (plus a sibling ``.key``) and listening
+# on ``/tmp/cc-socks/<pid>.sock``. The socket path is machine-wide, but the
+# registry is not: a session profile gets its own, so a `cswap run` session and
+# the default login cannot see each other even though both sockets are live and
+# owned by the same user. Sharing the registry directory is what closes that.
+
+
+@pytest.fixture
+def peers_setup(share_setup, temp_home: Path):
+    """share_setup plus a peer registry in ~/.claude."""
+    source, session_dir, mgr = share_setup
+    registry = source / "sessions"
+    registry.mkdir()
+    (registry / "4242.json").write_text('{"pid": 4242, "name": "app-1c"}\n')
+    (registry / "4242.deadbeef.key").write_text("secret\n")
+    return source, session_dir, mgr
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="peer sharing is POSIX-only")
+class TestSharePeersPosix:
+    def test_not_shared_by_default(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True)
+
+        assert not (session_dir / "sessions").exists()
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "sessions" not in manifest["items"]
+
+    def test_links_the_peer_registry(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+        manifest = json.loads((session_dir / SHARE_MANIFEST).read_text())
+        assert "sessions" in manifest["items"]
+
+    def test_the_link_exposes_existing_peers(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+
+        # The point of the feature: a session reading its own config home sees
+        # the entries the default profile advertised.
+        assert (session_dir / "sessions" / "4242.json").is_file()
+        assert (session_dir / "sessions" / "4242.deadbeef.key").is_file()
+
+    def test_creates_missing_source(self, share_setup):
+        source, session_dir, mgr = share_setup  # no registry in ~/.claude yet
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+
+        assert (source / "sessions").is_dir()
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+
+    def test_independent_of_no_share(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=False, share_peers=True)
+
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+        assert not (session_dir / "settings.json").exists()
+
+    def test_independent_of_share_history(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+
+        assert (session_dir / "sessions").is_symlink()
+        assert not (session_dir / "projects").exists()
+
+    def test_unlinks_when_turned_off(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+        mgr._sync_sharing(session_dir, share=True, share_peers=False)
+
+        assert not (session_dir / "sessions").exists()
+        # The shared registry itself survives - only the link goes.
+        assert (source / "sessions" / "4242.json").is_file()
+
+    def test_never_deletes_a_real_registry(self, peers_setup):
+        # A stale manifest must not be able to delete a profile's own live
+        # registry: same guard as history, for the same reason.
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+        (session_dir / "sessions").unlink()
+        own = session_dir / "sessions"
+        own.mkdir()
+        (own / "99.json").write_text('{"pid": 99}\n')
+
+        mgr._sync_sharing(session_dir, share=True, share_peers=False)
+
+        assert (own / "99.json").is_file()
+
+    def test_idempotent(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+
+        assert (session_dir / "sessions").readlink() == source / "sessions"
+
+
+class TestSharePeersRejectedOnWindows:
+    def test_run_rejects_the_flag(self, history_setup, monkeypatch):
+        # Windows shares by re-synced copies, and a *copied* registry is worse
+        # than none: it advertises pids and sockets that were never this
+        # machine's live ones, so peers would be offered dead addresses.
+        source, session_dir, mgr = history_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        monkeypatch.setattr(
+            session_mod.shutil, "which", lambda _name: "/usr/bin/claude"
+        )
+
+        with pytest.raises(SessionError, match="Windows"):
+            mgr.run(ACCOUNT_NUM, [], share=True, share_peers=True)
+
+    def test_sync_drops_peer_links_on_windows(self, peers_setup):
+        source, session_dir, mgr = peers_setup
+        mgr.switcher.platform = Platform.WINDOWS
+        mgr._sync_sharing(session_dir, share=True, share_peers=True)
+
+        assert not (session_dir / "sessions").exists()
+
+
 class TestReadSessionCredentials:
     """The profile's current credential JSON: keychain first, then plaintext."""
 
@@ -2740,3 +2864,4 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
